@@ -1,0 +1,53 @@
+name: Build installer
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build solution (Release|Win32)
+        run: msbuild AquaLang.sln /m /p:Configuration=Release /p:Platform=Win32
+
+      - name: Collect binaries and matching VC++ runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # build outputs land in .\dlls (OutDir = ..\dlls\ in each vcxproj)
+          foreach ($f in 'AquaLang.exe', 'AquaLangLib.dll', 'AutoStartSetter.exe') {
+            if (-not (Test-Path "dlls\$f")) { throw "Missing build output: dlls\$f" }
+          }
+
+          # SetupAquaLang.iss reads binaries from {#WORK}\AquaLang\Dlls
+          $work = Join-Path $env:RUNNER_TEMP 'work'
+          New-Item -ItemType Directory -Force -Path "$work\AquaLang\Dlls" | Out-Null
+          Copy-Item dlls\AquaLang.exe, dlls\AquaLangLib.dll, dlls\AutoStartSetter.exe "$work\AquaLang\Dlls"
+          "WORK=$work" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          # take the x86 CRT from the same VS install that compiled the binaries
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $redistVer = (Get-Content "$vs\VC\Auxiliary\Build\Microsoft.VCRedistVersion.default.txt").Trim()
+          $crt = "$vs\VC\Redist\MSVC\$redistVer\x86\Microsoft.VC143.CRT"
+          Copy-Item "$crt\vcruntime140.dll", "$crt\msvcp140.dll", "$crt\vccorlib140.dll" AquaLangSetup\
+          Write-Host "VC++ runtime $redistVer taken from $crt"
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc AquaLangSetup\SetupAquaLang.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed ($LASTEXITCODE)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AquaLang-installer-${{ github.sha }}
+          path: AquaLangSetup/Output/AquaLang.exe
